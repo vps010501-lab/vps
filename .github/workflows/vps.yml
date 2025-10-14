@@ -66,12 +66,14 @@ jobs:
           fi
           echo "✅ Created user 'not' with sudo (NOPASSWD)"
 
+      
       - name: Install Tailscale
         run: |
-          set -eux
-          curl -fsSL https://tailscale.com/install.sh | sh || true
-          # شغّل الديمون (systemd ثم fallback للخلفية)
-          (sudo systemctl enable --now tailscaled || (nohup sudo tailscaled >/tmp/tailscaled.log 2>&1 & sleep 8))
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-${{ github.run_id }}
+          tsIP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP: $tsIP"
 
       - name: Download latest backup artifact (if exists)
         uses: dawidd6/action-download-artifact@v2
