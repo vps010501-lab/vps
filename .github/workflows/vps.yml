@@ -1,0 +1,319 @@
+name: Continuous Persistent VPS (Root SSH + Tailscale)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # كل 6 ساعات
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: persistent-vps
+  cancel-in-progress: true
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-22.04
+    # نخليه أعلى من 6 ساعات شوية احتياطي (جيتهب قد يحده لحد أقصى 6 ساعات، بس ده يمنع القطع المبكر بسبب timeout-minutes أقل من المطلوب)
+    timeout-minutes: 365
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      UMASK: "022"
+      BACKUP_NAME: vps-backup
+      BACKUP_FILE: backup.tar.zst
+      # Fallback لو الـ Secret مش موجود — يُفضّل جداً إزالة ده واعتماد Secrets فقط
+      ROOT_PASSWORD_FALLBACK: "Tarboo1942003Mm*"
+      INCLUDE_DIRS: >-
+        /etc
+        /home
+        /root
+        /opt
+        /usr/local
+        /var/lib
+        /var/www
+        /srv
+        /usr/share/applications
+        /usr/share/fonts
+        /opt/vps-backup
+      EXCLUDES: >-
+        --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run
+        --exclude=/tmp --exclude=/var/tmp
+        --exclude=/var/cache --exclude=/var/lib/apt/lists
+        --exclude=/var/log --exclude=/var/log/journal
+        --exclude=/var/lib/docker --exclude=/var/lib/containerd
+        --exclude=*.log --exclude=*.tmp --exclude=*.iso
+        --exclude=*.tar --exclude=*.zip --exclude=*.docker
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download latest backup artifact (if exists)
+        uses: dawidd6/action-download-artifact@v2
+        continue-on-error: true
+        with:
+          name: ${{ env.BACKUP_NAME }}
+          path: ./backup
+
+      - name: Install base requirements (robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask "${UMASK}"
+
+          retry() {
+            local n=0 max=5 delay=5
+            until "$@"; do
+              n=$((n+1))
+              if [ $n -ge $max ]; then
+                echo "❌ Command failed after $n attempts: $*"
+                return 1
+              fi
+              echo "⏳ Retry $n/$max in ${delay}s: $*"
+              sleep $delay
+              delay=$((delay*2))
+            done
+          }
+
+          retry sudo apt-get update
+          retry sudo apt-get install -y \
+            curl gnupg ca-certificates lsb-release software-properties-common \
+            unzip sudo net-tools neofetch zstd tar rsync \
+            openssh-server \
+            nginx \
+            mariadb-server \
+            redis-server \
+            php-fpm php-cli php-mbstring php-xml php-curl php-zip php-mysql php-gd \
+            composer
+
+      - name: Restore full-state (if present)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask "${UMASK}"
+          if [ -f "./backup/${{ env.BACKUP_FILE }}" ]; then
+            echo "🔄 Restoring ${{ env.BACKUP_FILE }} to / ..."
+            sudo tar -I 'zstd -d' -xPpf "./backup/${{ env.BACKUP_FILE }}" --warning=no-timestamp
+            echo "✅ Restoration completed"
+          else
+            echo "ℹ️ No prior backup found. Starting fresh."
+          fi
+
+      - name: Basic info & hostname
+        run: |
+          sudo hostnamectl set-hostname persistent-vps
+          echo "127.0.0.1 persistent-vps" | sudo tee -a /etc/hosts
+          echo "🏷️ Hostname: persistent-vps"
+          echo "👤 SSH user: root"
+
+      - name: Ensure root password (prefers Secret, else fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PASS="${{ secrets.ROOT_PASSWORD || env.ROOT_PASSWORD_FALLBACK }}"
+          if [ -z "$PASS" ]; then
+            echo "::error::No ROOT_PASSWORD secret or fallback provided"
+            exit 1
+          fi
+          echo "::add-mask::$PASS"
+          echo "root:$PASS" | sudo chpasswd
+          echo "✅ Root password set successfully"
+
+      - name: Harden & configure OpenSSH for root login + keepalive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /run/sshd
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?UsePAM .*/UsePAM yes/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?LoginGraceTime .*/LoginGraceTime 120/g' /etc/ssh/sshd_config
+          # إبقاء الجلسات حية وعدم قطعها مبكراً
+          if grep -q '^ClientAliveInterval' /etc/ssh/sshd_config; then
+            sudo sed -i 's/^ClientAliveInterval.*/ClientAliveInterval 30/g' /etc/ssh/sshd_config
+          else
+            echo 'ClientAliveInterval 30' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          fi
+          if grep -q '^ClientAliveCountMax' /etc/ssh/sshd_config; then
+            sudo sed -i 's/^ClientAliveCountMax.*/ClientAliveCountMax 120/g' /etc/ssh/sshd_config
+          else
+            echo 'ClientAliveCountMax 120' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          fi
+          if ! grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config; then
+            echo 'ListenAddress 0.0.0.0' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          fi
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+          echo "✅ SSH configured and started"
+
+      - name: Start core services (nginx, mariadb, redis, php-fpm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl enable --now mariadb redis-server nginx || true
+          if systemctl list-unit-files | grep -q php8.2-fpm; then
+            sudo systemctl enable --now php8.2-fpm
+          elif systemctl list-unit-files | grep -q php8.1-fpm; then
+            sudo systemctl enable --now php8.1-fpm
+          else
+            sudo systemctl enable --now php8.0-fpm || true
+          fi
+
+          # MariaDB baseline
+          sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');" || true
+          sudo mysql -e "FLUSH PRIVILEGES;" || true
+          echo "✅ Core services started"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          echo "✅ Tailscale installed"
+
+      - name: Start & login to Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
+            echo "::error::TAILSCALE_AUTHKEY secret is missing"
+            exit 1
+          fi
+          sudo pkill tailscaled || true
+          sleep 2
+          sudo mkdir -p /var/lib/tailscale
+          sudo chown tailscale:tailscale /var/lib/tailscale || true
+          sudo systemctl enable tailscaled
+          sudo systemctl start tailscaled
+          sleep 5
+          sudo tailscale up --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" --hostname=persistent-vps --accept-routes --accept-dns
+          echo "🔗 Tailscale Status:"
+          sudo tailscale status
+          echo "🌐 Tailscale IPv4:"
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+          echo "ssh root@$TAILSCALE_IP"
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+
+      - name: Pre-sleep checkpoint (DB dumps + state)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "💾 Creating checkpoint..."
+          sudo mkdir -p /opt/vps-backup/{data,meta,cron,db}
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
+          fi
+          sudo mysqldump --all-databases --single-transaction --quick --lock-tables=false > /tmp/all-databases.sql 2>/dev/null || true
+          if [ -s /tmp/all-databases.sql ]; then
+            sudo mv /tmp/all-databases.sql /opt/vps-backup/db/all-databases.sql || true
+          fi
+          sudo redis-cli SAVE >/dev/null 2>&1 || true
+          if [ -f /var/lib/redis/dump.rdb ]; then
+            sudo cp /var/lib/redis/dump.rdb /opt/vps-backup/db/redis-dump.rdb || true
+          fi
+          dpkg --get-selections | grep -v deinstall > /tmp/pkg-selections.txt || true
+          apt-mark showmanual > /tmp/pkg-manual.txt || true
+          sudo cp /tmp/pkg-selections.txt /opt/vps-backup/meta/ || true
+          sudo cp /tmp/pkg-manual.txt /opt/vps-backup/meta/ || true
+          if [ -d /var/spool/cron ]; then sudo cp -a /var/spool/cron /opt/vps-backup/cron/ || true; fi
+          if [ -f /etc/crontab ]; then sudo cp /etc/crontab /opt/vps-backup/cron/ || true; fi
+          sudo chown -R $USER:$USER /opt/vps-backup
+          echo "📦 Creating CHECKPOINT archive..."
+          sudo tar -I 'zstd -3 -T0' -cpf checkpoint.tar.zst ${{ env.EXCLUDES }} ${{ env.INCLUDE_DIRS }} 2>/dev/null || true
+          sudo chown $USER:$USER checkpoint.tar.zst || true
+          ls -lh checkpoint.tar.zst || echo "Checkpoint creation failed"
+
+      - name: Upload checkpoint artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_NAME }}-checkpoint
+          path: checkpoint.tar.zst
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Display connection info
+        run: |
+          echo "🎯 ===== CONNECTION INFORMATION ====="
+          echo "📍 Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "🔑 SSH Command: ssh root@${{ env.TAILSCALE_IP }}"
+          echo "⏰ Session planned duration: 6 hours"
+          echo "📱 Services running: SSH, Nginx, MySQL, Redis, PHP-FPM"
+          echo "🕒 Start time: $(date)"
+          echo "====================================="
+
+      # إبقاء الجلسة حية بإخراج مستمر (تجنّب مهلة انعدام المخرجات)
+      - name: Keep VPS alive (6h, verbose heartbeat)
+        shell: bash
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          DURATION=$((6*60*60))  # 6 ساعات بالثواني
+          END=$((START + DURATION))
+
+          trap 'echo "🛑 Caught signal, finishing gracefully..."; exit 0' SIGTERM SIGINT
+
+          echo "🔄 Keeping VPS alive for 6 hours with per-minute heartbeat..."
+          i=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            i=$((i+1))
+            REM=$(( (END-$(date +%s)) / 60 ))
+            # نبقي مخرجات كل دقيقة لتفادي إيقاف Github Actions بسبب الصمت
+            echo "⏳ Alive heartbeat #$i — ~${REM} min remaining — $(date)"
+            sleep 60
+          done
+          echo "✅ Session completed full duration"
+
+      - name: Prepare backup metadata (final)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "📦 Preparing final backup..."
+          sudo mkdir -p /opt/vps-backup/{data,meta,cron,db}
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
+          fi
+          sudo mysqldump --all-databases --single-transaction --quick --lock-tables=false > /tmp/all-databases.sql 2>/dev/null || true
+          if [ -s /tmp/all-databases.sql ]; then
+            sudo mv /tmp/all-databases.sql /opt/vps-backup/db/all-databases.sql || true
+          fi
+          sudo redis-cli SAVE >/dev/null 2>&1 || true
+          if [ -f /var/lib/redis/dump.rdb ]; then
+            sudo cp /var/lib/redis/dump.rdb /opt/vps-backup/db/redis-dump.rdb || true
+          fi
+          dpkg --get-selections | grep -v deinstall > /tmp/pkg-selections.txt || true
+          apt-mark showmanual > /tmp/pkg-manual.txt || true
+          sudo cp /tmp/pkg-selections.txt /opt/vps-backup/meta/ || true
+          sudo cp /tmp/pkg-manual.txt /opt/vps-backup/meta/ || true
+          if [ -d /var/spool/cron ]; then sudo cp -a /var/spool/cron /opt/vps-backup/cron/ || true; fi
+          if [ -f /etc/crontab ]; then sudo cp /etc/crontab /opt/vps-backup/cron/ || true; fi
+          sudo chown -R $USER:$USER /opt/vps-backup
+          echo "✅ Backup metadata prepared"
+
+      - name: Create full-state backup (tar.zst)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "📦 Creating final archive ${{ env.BACKUP_FILE }} ..."
+          sudo tar -I 'zstd -3 -T0' -cpf ${{ env.BACKUP_FILE }} ${{ env.EXCLUDES }} ${{ env.INCLUDE_DIRS }} 2>/dev/null || true
+          sudo chown $USER:$USER ./${{ env.BACKUP_FILE }} || true
+          ls -lh ./${{ env.BACKUP_FILE }} || echo "Backup creation failed"
+          echo "✅ Final backup created"
+
+      - name: Upload final backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_NAME }}
+          path: ./${{ env.BACKUP_FILE }}
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Session completion message
+        if: always()
+        run: |
+          echo "🎉 VPS Session completed!"
+          echo "📁 Backup saved as artifact: ${{ env.BACKUP_NAME }}"
+          echo "🔄 Next session will start in 6 hours"
+          echo "🔗 Use: ssh root@${{ env.TAILSCALE_IP }} to connect next time"
