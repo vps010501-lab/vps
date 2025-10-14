@@ -1,142 +1,40 @@
-name: Continuous Persistent VPS (Tailscale, Root SSH, ZIP backup)
-
+name: VPS
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
-
 jobs:
-  vps-session:
-    runs-on: ubuntu-22.04
+  secure-vps:
+    runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Display startup info
+      - name: Install & Configure SSH
         run: |
-          echo "Creating hostname root@notfleppy"
-          echo "Enabling root SSH with provided password"
-
-      - name: Set hostname
-        run: |
-          sudo hostnamectl set-hostname root@notfleppy
-          echo "127.0.0.1 root@notfleppy" | sudo tee -a /etc/hosts >/dev/null || true
-
-      - name: Install prerequisites (SSH, tools, zip)
-        run: |
-          set -euxo pipefail
-          sudo apt-get update -y || true
-          sudo apt-get install -y \
-            openssh-server curl unzip zip sudo net-tools neofetch || true
-
-      - name: Configure OpenSSH for root password login
-        run: |
-          set -eux
-          sudo mkdir -p /run/sshd
-          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/g' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?UsePAM .*/UsePAM yes/g' /etc/ssh/sshd_config
-          if ! grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config; then
-            echo 'ListenAddress 0.0.0.0' | sudo tee -a /etc/ssh/sshd_config >/dev/null
-          fi
-          # ابدأ الخدمة (بدون systemd)
-          (sudo service ssh restart || sudo /etc/init.d/ssh restart || true)
-          echo "✅ SSH is up"
-
-      - name: Set root password (masked)
-        run: |
-          echo "::add-mask::Tarboo1942003Mm*"
-          echo "root:Tarboo1942003Mm*" | sudo chpasswd
-          echo "✅ Root password set"
-
-      # تنزيل آخر نسخة احتياطية (إن وُجدت) إلى ./backup/backup.zip
-      - name: Download latest backup artifact (if exists)
-        uses: dawidd6/action-download-artifact@v2
-        continue-on-error: true
-        with:
-          name: vps-backup
-          path: ./backup
+          sudo apt update -y
+          sudo apt install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          echo "root:admin@123" | sudo chpasswd
+          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+          sudo service ssh restart
+          echo "✅ SSH user: root | pass: admin@123"
 
       - name: Install Tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh || true
-          echo "✅ Tailscale installed"
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-${{ github.run_id }}
+          tsIP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP: $tsIP"
 
-      - name: Restore backup files (ZIP method)
+      - name: Verify SSH Access
         run: |
-          if [ -f ./backup/backup.zip ]; then
-            echo "🔄 Restoring ./backup/backup.zip to /"
-            sudo unzip -o ./backup/backup.zip -d / || true
-            echo "✅ Backup restored"
-          else
-            echo "ℹ️ No backup found, starting fresh"
-          fi
+          echo "Tailscale VPS ready!"
+          echo "IP: $env:TAILSCALE_IP"
+          echo "User: root"
+          echo "Pass: admin@123"
 
-      - name: Restore Tailscale state (if present)
+      - name: Keep VPS Alive
         run: |
-          set -eux
-          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
-            sudo mkdir -p /var/lib/tailscale
-            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state || true
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state || true
-            echo "✅ Tailscale state restored"
-          else
-            echo "ℹ️ No previous Tailscale state to restore"
-          fi
-
-      - name: Start Tailscale (no auth key; rely on restored state)
-        run: |
-          # شغّل الديمون في الخلفية
-          sudo tailscaled >/tmp/tailscaled.log 2>&1 &
-          sleep 8
-          # حاول تفعيل الاتصال بالاعتماد على الحالة المستعادة (لن يفشل الجوب لو احتاج تسجيل يدوي)
-          sudo tailscale up --hostname=root@notfleppy --accept-dns --accept-routes || true
-          echo "🔗 Tailscale status (non-fatal if not logged in yet):"
-          (sudo tailscale status || true)
-          echo "🌐 Tailscale IPv4:"
-          (TSIP=$(sudo tailscale ip -4 || true) && echo "$TSIP" && echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV || true)
-
-      - name: Show connection info
-        run: |
-          echo "🎯 ===== CONNECTION INFO ====="
-          echo "SSH: ssh root@${{ env.TAILSCALE_IP }}"
-          echo "Session length: 6 hours"
-          echo "Start time: $(date)"
-          echo "=============================="
-
-      - name: Keep alive for 6 hours (robust loop)
-        run: |
-          set +e
-          echo "🔄 Keeping the session alive for 6 hours..."
-          end=$((SECONDS + 21600))
-          i=0
-          while [ $SECONDS -lt $end ]; do
-            i=$((i+1))
-            echo "⏳ Still running... minute $i / 360"
-            sleep 60 || true
+          while true; do
+            echo "[$(date)] VPS running..."
+            sleep 300
           done
-          echo "✅ Time elapsed: 6 hours"
-
-      - name: Backup VPS data and Tailscale state (ZIP method)
-        if: always()
-        run: |
-          set +e
-          sudo mkdir -p /opt/vps-backup/data || true
-          if [ -f /var/lib/tailscale/tailscaled.state ]; then
-            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
-          fi
-          sudo chown -R $USER:$USER /opt/vps-backup || true
-          rm -f backup.zip || true
-          (cd / && zip -r -q "$GITHUB_WORKSPACE/backup.zip" opt/vps-backup) || true
-          ls -lh backup.zip || echo "⚠️ backup.zip not created"
-
-      - name: Upload VPS backup artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vps-backup
-          path: backup.zip
-          if-no-files-found: ignore
