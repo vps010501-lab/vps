@@ -1,9 +1,9 @@
-name: Continuous Persistent VPS (Pro)
+name: Continuous VPS with SSH & Tailscale
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'     # كل 6 ساعات
-  workflow_dispatch: {}        # تشغيل يدوي
+    - cron: "0 */6 * * *"  # كل 6 ساعات
 
 permissions:
   contents: read
@@ -13,44 +13,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  vps:
+  vps-session:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
-
-    env:
-      HOSTNAME_BASE: "vps"
-      ROOT_PASSWORD: "Tarboo1942003Mm*"   # مُتعمَّد حسب طلبك (خطر أمني)
-      ENABLE_TMUX: "0"                    # غيّر إلى "1" لو تبي tmate
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Display startup info
+      - name: Fail fast if Tailscale key missing
+        if: ${{ secrets.TAILSCALE_AUTH_KEY == '' }}
         run: |
-          echo "▶️ Booting ephemeral VPS runner"
-          echo "Hostname base: $HOSTNAME_BASE"
+          echo "❌ Missing secret TAILSCALE_AUTH_KEY. Add it in: Settings → Secrets → Actions."
+          exit 1
 
-      # إعداد hostname ثابت ونظيف
-      - name: Set hostname
-        run: |
-          set -eux
-          NEW_HOSTNAME="${HOSTNAME_BASE}-${GITHUB_RUN_ID}"
-          sudo hostnamectl set-hostname "$NEW_HOSTNAME"
-          if ! grep -q "$NEW_HOSTNAME" /etc/hosts; then
-            echo "127.0.0.1 $NEW_HOSTNAME" | sudo tee -a /etc/hosts >/dev/null
-          fi
-          echo "✅ Hostname set to $NEW_HOSTNAME"
-
-      # تثبيت باكدجات أساسية + SSH
-      - name: Install base packages & SSH
+      - name: System prep (packages, hostname)
         run: |
           set -eux
           sudo apt-get update -y
-          sudo apt-get install -y openssh-server jq curl unzip zip sudo net-tools neofetch ufw
+          sudo apt-get install -y --no-install-recommends \
+            openssh-server jq curl unzip zip sudo net-tools neofetch ufw
+
+          # Hostname نظيف بدون رموز
+          sudo hostnamectl set-hostname vps-${{ github.run_id }}
+          if ! grep -q "vps-${{ github.run_id }}" /etc/hosts; then
+            echo "127.0.0.1 vps-${{ github.run_id }}" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
+      - name: Configure & start SSH (root login)
+        run: |
+          set -eux
           sudo mkdir -p /run/sshd
 
-          # تهيئة SSH بشكل idempotent
+          # تفعيل root login وكلمة المرور
           sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/g' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/g' /etc/ssh/sshd_config
@@ -59,70 +54,54 @@ jobs:
             echo 'ListenAddress 0.0.0.0' | sudo tee -a /etc/ssh/sshd_config >/dev/null
           fi
 
-          # تعيين باسورد الروت مع إخفائه في اللوج
-          echo "::add-mask::$ROOT_PASSWORD"
-          echo "root:$ROOT_PASSWORD" | sudo chpasswd
+          # باسورد الروت (سيُخفى في اللوج)
+          echo "::add-mask::Tarboo1942003Mm*"
+          echo "root:Tarboo1942003Mm*" | sudo chpasswd
 
-          # جدار ناري بسيط (يُسمح لـ SSH فقط محليًا؛ Tailscale يوفّر قناة آمنة)
-          sudo ufw --force reset
-          sudo ufw allow 22/tcp
+          # فتح جدار الحماية لـ SSH (إن وجد ufw)
+          sudo ufw --force reset || true
+          sudo ufw allow 22/tcp || true
           sudo ufw --force enable || true
 
           sudo systemctl enable ssh || true
           sudo systemctl restart ssh || sudo service ssh restart || true
-          echo "✅ SSH ready for root login"
+          echo "✅ SSH enabled for user root"
 
-      # تثبيت وربط Tailscale باستخدام السر (رابط/مفتاح) فقط
       - name: Install & Link Tailscale
-        if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -eux
+          # تثبيت tailscale
           curl -fsSL https://tailscale.com/install.sh | sh
-          # نستخدم -E للحفاظ على متغيّر TS_AUTHKEY في sudo
+
+          # الربط باستخدام الـ Secret فقط
+          # نستخدم sudo -E حتى يمر TS_AUTHKEY للـ tailscale
           sudo -E tailscale up \
-            --hostname="${HOSTNAME_BASE}-${GITHUB_RUN_ID}" \
-            --ssh \
-            --accept-routes
+            --hostname=vps-${{ github.run_id }}
 
-          # حفظ الـ IP في متغيرات البيئة لباقي الخطوات
-          tsIP=$(tailscale ip -4 | head -n 1 || true)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "✅ Tailscale IP: ${tsIP:-N/A}"
+          # الحصول على IP (IPv4) من Tailscale
+          tsIP="$(tailscale ip -4 | head -n 1 || true)"
+          echo "TAILSCALE_IP=${tsIP}" >> "$GITHUB_ENV"
+          echo "::add-mask::${tsIP}"
+          echo "✅ Tailscale IP: ${tsIP}"
 
-      - name: Fail if Tailscale key missing
-        if: ${{ secrets.TAILSCALE_AUTH_KEY == '' }}
-        run: |
-          echo "❌ Missing secret TAILSCALE_AUTH_KEY. Add it in: Settings → Secrets → Actions."
-          exit 1
-
-      # (اختياري) tmate للتصحيح الحي
-      - name: Start tmate session (optional)
-        if: env.ENABLE_TMUX == '1'
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-
-      # معلومات نهائية عن الاتصال
-      - name: Show SSH & Tailscale info
+      - name: Show access info
         run: |
           set -eux
-          echo "━━━━━━━━ CONNECTION INFO ━━━━━━━━"
-          echo "🔑 user: root"
-          echo "🔐 pass: (hidden)"
-          echo "::add-mask::$ROOT_PASSWORD"
-          printf "🔌 SSH (public runner IP): "; hostname -I | awk '{print $1}'
-          echo "🌀 Tailscale IPv4: ${TAILSCALE_IP:-N/A}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "-------------------------------"
+          echo " Hostname  : vps-${{ github.run_id }}"
+          echo " SSH (root): password 'Tarboo1942003Mm*'"
+          echo " Public IP : (runner's ephemeral; use Tailscale IP below)"
+          echo " TS IP     : $TAILSCALE_IP"
+          echo "-------------------------------"
+          echo "Tip: Connect over Tailscale SSH or regular SSH via the TS IP if routes allow."
 
-      # إبقاء الـ runner حي (لو تبي جلسة طويلة)
-      - name: Keep VPS Alive (6h loop)
+      - name: Keep alive (6h loop)
         run: |
-          echo "⏳ Keeping the VPS alive up to 6 hours..."
-          for i in $(seq 1 360); do
-            printf "."
+          echo "⏳ Keeping the VPS session alive..."
+          for i in $(seq 1 360); do  # ~360 دقيقة
+            echo "tick $i - $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
             sleep 60
           done
-          echo ""
-          echo "✅ Session ended."
+          echo "✅ Done."
