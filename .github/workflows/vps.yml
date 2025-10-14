@@ -1,40 +1,185 @@
-name: VPS
+name: Continuous Persistent VPS (Merged)
+
 on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: persistent-vps
+  cancel-in-progress: true
+
 jobs:
-  secure-vps:
-    runs-on: ubuntu-latest
+  vps-session:
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
+    env:
+      # تحكم اختياري لتشغيل tmate (1 لتشغيله، 0 لتعطيله)
+      ENABLE_TMUX: "1"
+
     steps:
-      - name: Install & Configure SSH
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Display startup info
         run: |
-          sudo apt update -y
-          sudo apt install -y openssh-server
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          echo "root:admin@123" | sudo chpasswd
-          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
-          sudo service ssh restart
-          echo "✅ SSH user: root | pass: admin@123"
+          echo "Creating hostname root@notfleppy"
+          echo "Creating user 'not' with password 'fleppy'"
+
+      - name: Set hostname
+        run: |
+          sudo hostnamectl set-hostname root@notfleppy
+          echo "127.0.0.1 root@notfleppy" | sudo tee -a /etc/hosts >/dev/null
+
+      - name: Install & Configure SSH (root login)
+        run: |
+          set -eux
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server jq curl unzip zip sudo net-tools neofetch
+          sudo mkdir -p /run/sshd
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/g' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?UsePAM .*/UsePAM yes/g' /etc/ssh/sshd_config
+          if ! grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config; then
+            echo 'ListenAddress 0.0.0.0' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          fi
+          sudo systemctl enable ssh || true
+          sudo systemctl restart ssh || sudo service ssh restart || true
+
+          # ضبط باسورد root (مع إخفائه في اللوج)
+          echo "::add-mask::Tarboo1942003Mm*"
+          echo "root:Tarboo1942003Mm*" | sudo chpasswd
+          echo "✅ SSH Enabled | user: root"
+
+      - name: Create user 'not' with password 'fleppy'
+        run: |
+          set -eux
+          if ! id -u not >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash not
+            echo "not:fleppy" | sudo chpasswd
+            sudo usermod -aG sudo not
+            echo "not ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/not
+          fi
+          echo "✅ Created user 'not' with sudo (NOPASSWD)"
 
       - name: Install Tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-${{ github.run_id }}
-          tsIP=$(tailscale ip -4 | head -n 1)
+          set -eux
+          curl -fsSL https://tailscale.com/install.sh | sh || true
+          # شغّل الديمون (systemd ثم fallback للخلفية)
+          (sudo systemctl enable --now tailscaled || (nohup sudo tailscaled >/tmp/tailscaled.log 2>&1 & sleep 8))
+
+      - name: Download latest backup artifact (if exists)
+        uses: dawidd6/action-download-artifact@v2
+        continue-on-error: true
+        with:
+          name: vps-backup
+          path: ./backup
+
+      - name: Restore backup files (ZIP method)
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            echo "🔄 Restoring ./backup/backup.zip to /"
+            sudo unzip -o ./backup/backup.zip -d / || true
+            echo "✅ Backup restored"
+          else
+            echo "ℹ️ No backup found, starting fresh"
+          fi
+
+      - name: Restore Tailscale state (if present)
+        run: |
+          set -eux
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state || true
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state || true
+            echo "✅ Tailscale state restored"
+          else
+            echo "ℹ️ No previous Tailscale state to restore"
+          fi
+
+      - name: Link Tailscale (Auth Key -> IP & MagicDNS)
+        run: |
+          set -eux
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "::error::TAILSCALE_AUTH_KEY secret is missing"
+            exit 1
+          fi
+
+          HOST="vps-${{ github.run_id }}"
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="$HOST" \
+            --accept-dns \
+            --accept-routes
+
+          tsIP=$(sudo tailscale ip -4 | head -n 1 || true)
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "✅ Tailscale IP: $tsIP"
 
-      - name: Verify SSH Access
-        run: |
-          echo "Tailscale VPS ready!"
-          echo "IP: $env:TAILSCALE_IP"
-          echo "User: root"
-          echo "Pass: admin@123"
+          dnsName=$(sudo tailscale status --json | jq -r '.Self.DNSName // empty' || true)
+          if [ -n "$dnsName" ]; then
+            echo "TAILSCALE_DNS=$dnsName" >> $GITHUB_ENV
+          fi
 
-      - name: Keep VPS Alive
+          echo "✅ Tailscale linked. IP: $tsIP"
+          if [ -n "${dnsName:-}" ]; then
+            echo "🌐 MagicDNS: $dnsName"
+          fi
+          echo "🔑 SSH: ssh root@$tsIP"
+
+      - name: Start tmate session (optional)
+        if: ${{ env.ENABLE_TMUX == '1' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit: 30m  # يغلق بعد 30 دقيقة تلقائيًا
+        continue-on-error: true
+
+      - name: Show Tailscale IP and tmate info
         run: |
-          while true; do
-            echo "[$(date)] VPS running..."
-            sleep 300
+          echo "🔗 Tailscale IPv4: ${TAILSCALE_IP:-N/A}"
+          if [ -n "${TAILSCALE_DNS:-}" ]; then
+            echo "🌐 MagicDNS: ${TAILSCALE_DNS}"
+          fi
+          echo "🔑 SSH command(s):"
+          [ -n "${TAILSCALE_IP:-}" ] && echo "ssh root@${TAILSCALE_IP}"
+          [ -n "${TAILSCALE_DNS:-}" ] && echo "ssh root@${TAILSCALE_DNS}"
+          # في بعض البيئات قد يطبع action-tmate الإرشادات تلقائيًا
+          cat "$HOME/.tmate.sock/ssh" 2>/dev/null || true
+
+      - name: Keep VPS Alive (6h robust loop)
+        run: |
+          set +e
+          end=$((SECONDS + 21600))  # 6 ساعات
+          i=0
+          while [ $SECONDS -lt $end ]; do
+            i=$((i+1))
+            now=$(date +"%F %T")
+            echo "[$now] VPS running... minute $i/360"
+            sleep 60 || true
           done
+          echo "✅ Completed 6 hours without premature exit"
+
+      - name: Backup VPS data and tailscale state (ZIP)
+        if: always()
+        run: |
+          set +e
+          sudo mkdir -p /opt/vps-backup/data || true
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
+          fi
+          sudo chown -R $USER:$USER /opt/vps-backup || true
+          rm -f backup.zip || true
+          (cd / && zip -r -q "$GITHUB_WORKSPACE/backup.zip" opt/vps-backup) || true
+          ls -lh backup.zip || echo "⚠️ backup.zip not created"
+
+      - name: Upload VPS backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
+          if-no-files-found: ignore
